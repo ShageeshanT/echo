@@ -1,7 +1,6 @@
 """
 E.C.H.O. — Enhanced Cognitive Heuristic Operator
-3D dot-globe with voice-reactive deformation.
-Clean dark dot-matrix theme.
+3D dot-globe · vertical audio visualizer · animated background strokes
 """
 
 import tkinter as tk
@@ -9,6 +8,7 @@ import math
 import random
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -29,24 +29,29 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-WIN_W, WIN_H = 1200, 800
-PANEL_H = 170
-TITLE_H = 40
+WIN_W, WIN_H = 950, 620
+PANEL_H = 145
+TITLE_H = 38
+SIDEBAR_W = 48
 FPS = 38
 FRAME_MS = int(1000 / FPS)
-NUM_DOTS = 7000  # dense globe
+NUM_DOTS = 7000
+NUM_STROKES = 18
 
 
 class Col:
     bg      = "#080808"
     bg2     = "#0c0c0c"
     panel   = "#0a0a0a"
+    sidebar = "#0a0a0a"
     border  = "#1a1a1a"
     accent  = "#d8d8d8"
     accent2 = "#888888"
     muted   = "#444444"
     dim     = "#222222"
     green   = "#00e676"
+    cyan    = "#00e5ff"
+    cyan_dim = "#004d55"
     danger  = "#ff1744"
     warning = "#ffab00"
     dot_on  = "#d0d0d0"
@@ -139,44 +144,112 @@ def draw_dot_text(cv, text, x, y, dot=3.0, sp=1.4, color=Col.dot_on,
 
 
 # ---------------------------------------------------------------------------
-# 3D Dot Globe (Fibonacci sphere, numpy-rendered)
+# Background stroke (animated line that fades in/out)
+# ---------------------------------------------------------------------------
+class Stroke:
+    __slots__ = ("x0", "y0", "angle", "length", "speed", "life", "max_life",
+                 "brightness", "width")
+
+    def __init__(self, w, h):
+        self.respawn(w, h)
+
+    def respawn(self, w, h):
+        self.x0 = random.uniform(-50, w + 50)
+        self.y0 = random.uniform(-50, h + 50)
+        self.angle = random.uniform(0, math.tau)
+        self.length = random.uniform(60, 250)
+        self.speed = random.uniform(0.3, 1.2)
+        self.life = 0.0
+        self.max_life = random.uniform(80, 220)
+        self.brightness = random.uniform(12, 30)
+        self.width = random.choice([1, 1, 1, 2])
+
+    def update(self, w, h):
+        self.life += 1
+        # Drift
+        self.x0 += math.cos(self.angle) * self.speed
+        self.y0 += math.sin(self.angle) * self.speed
+        if self.life > self.max_life:
+            self.respawn(w, h)
+
+    @property
+    def alpha(self):
+        """Fade-in then fade-out envelope."""
+        frac = self.life / self.max_life
+        if frac < 0.15:
+            return frac / 0.15
+        elif frac > 0.75:
+            return (1.0 - frac) / 0.25
+        return 1.0
+
+    def endpoints(self):
+        dx = math.cos(self.angle) * self.length
+        dy = math.sin(self.angle) * self.length
+        return self.x0, self.y0, self.x0 + dx, self.y0 + dy
+
+
+# ---------------------------------------------------------------------------
+# Bresenham line into numpy buffer
+# ---------------------------------------------------------------------------
+def draw_line_buf(buf, x0, y0, x1, y1, brightness, h, w):
+    """Draw an anti-aliased-ish line into a 2D float32 buffer."""
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    steps = 0
+    max_steps = dx + dy + 1
+    while steps < max_steps:
+        if 0 <= y0 < h and 0 <= x0 < w:
+            buf[y0, x0] = max(buf[y0, x0], brightness)
+            # Soften: neighboring pixels
+            if y0 + 1 < h:
+                buf[y0 + 1, x0] = max(buf[y0 + 1, x0], brightness * 0.3)
+            if x0 + 1 < w:
+                buf[y0, x0 + 1] = max(buf[y0, x0 + 1], brightness * 0.3)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+        steps += 1
+
+
+# ---------------------------------------------------------------------------
+# 3D Dot Globe
 # ---------------------------------------------------------------------------
 class DotGlobe:
-    """Massive 3D sphere of dots, rendered to a numpy buffer."""
-
     def __init__(self, n_dots, render_w, render_h):
         self.n = n_dots
         self.w = render_w
         self.h = render_h
 
-        # Fibonacci sphere distribution
         idx = np.arange(n_dots, dtype=np.float64)
         phi = np.arccos(1.0 - 2.0 * (idx + 0.5) / n_dots)
         theta = math.pi * (1.0 + math.sqrt(5.0)) * idx
 
-        # Base unit-sphere coordinates
         self.base_x = np.sin(phi) * np.cos(theta)
         self.base_y = np.sin(phi) * np.sin(theta)
         self.base_z = np.cos(phi)
+        self.phi = phi
+        self.theta = theta
 
-        # Store spherical coords for deformation mapping
-        self.phi = phi      # 0..pi (pole to pole)
-        self.theta = theta  # azimuthal
-
-        # Trail buffer (persistence)
         self.buf = np.zeros((render_h, render_w), dtype=np.float32)
 
-        # Pre-compute glow kernel offsets (3x3 + 5x5 outer)
+        # Background strokes
+        self.strokes = [Stroke(render_w, render_h) for _ in range(NUM_STROKES)]
+
         self._kernel_3 = []
         for dx in range(-1, 2):
             for dy in range(-1, 2):
                 d = abs(dx) + abs(dy)
-                if d == 0:
-                    f = 1.0
-                elif d == 1:
-                    f = 0.38
-                else:
-                    f = 0.18
+                f = 1.0 if d == 0 else (0.38 if d == 1 else 0.18)
                 self._kernel_3.append((dx, dy, f))
 
         self._kernel_5 = []
@@ -188,48 +261,41 @@ class DotGlobe:
                 self._kernel_5.append((dx, dy, 0.08 / max(d, 1)))
 
     def render(self, t, audio, bands):
-        """Render one frame. Returns PIL Image (RGB)."""
         w, h = self.w, self.h
         cx, cy = w / 2, h / 2
         n = self.n
 
         # --- Deformation ---
         deform = np.ones(n, dtype=np.float64)
-        deform += audio * 0.35                                   # overall pulse
-        deform += bands[0] * 0.25                                # bass: breathe
-        deform += bands[1] * 0.18 * np.cos(self.phi)            # low: Y-stretch
-        deform += bands[2] * 0.15 * np.sin(self.phi * 2)        # low-mid: equator bulge
-        deform += bands[3] * 0.12 * np.cos(self.theta * 2 + t * 2)  # mid: latitude wave
+        deform += audio * 0.35
+        deform += bands[0] * 0.25
+        deform += bands[1] * 0.18 * np.cos(self.phi)
+        deform += bands[2] * 0.15 * np.sin(self.phi * 2)
+        deform += bands[3] * 0.12 * np.cos(self.theta * 2 + t * 2)
         deform += bands[4] * 0.10 * np.sin(self.phi * 3) * np.cos(self.theta * 3 + t * 1.5)
-        deform += bands[5] * 0.08 * np.sin(self.theta * 4 + t * 3)  # hi-mid: ripple
-        deform += bands[6] * 0.06 * np.sin(self.theta * 6 + t * 4)  # treble: fine ripple
-        deform += bands[7] * 0.05 * np.cos(self.phi * 5 + t * 5)    # air: shimmer
+        deform += bands[5] * 0.08 * np.sin(self.theta * 4 + t * 3)
+        deform += bands[6] * 0.06 * np.sin(self.theta * 6 + t * 4)
+        deform += bands[7] * 0.05 * np.cos(self.phi * 5 + t * 5)
 
         xs = self.base_x * deform
         ys = self.base_y * deform
         zs = self.base_z * deform
 
         # --- Rotation ---
-        ay = t * 0.25 + audio * t * 0.15   # Y-rotation, speeds up with voice
-        ax = 0.35 + math.sin(t * 0.15) * 0.12  # gentle X-tilt wobble
-        az = math.sin(t * 0.1) * 0.08           # slight Z-roll
+        ay = t * 0.25 + audio * t * 0.15
+        ax = 0.35 + math.sin(t * 0.15) * 0.12
+        az = math.sin(t * 0.1) * 0.08
 
-        # Rotate Y
-        cy_r, sy_r = math.cos(ay), math.sin(ay)
-        nx = xs * cy_r + zs * sy_r
-        nz = -xs * sy_r + zs * cy_r
+        c_, s_ = math.cos(ay), math.sin(ay)
+        nx = xs * c_ + zs * s_; nz = -xs * s_ + zs * c_
         xs, zs = nx, nz
 
-        # Rotate X
-        cx_r, sx_r = math.cos(ax), math.sin(ax)
-        ny = ys * cx_r - zs * sx_r
-        nz = ys * sx_r + zs * cx_r
+        c_, s_ = math.cos(ax), math.sin(ax)
+        ny = ys * c_ - zs * s_; nz = ys * s_ + zs * c_
         ys, zs = ny, nz
 
-        # Rotate Z
-        cz_r, sz_r = math.cos(az), math.sin(az)
-        nx = xs * cz_r - ys * sz_r
-        ny = xs * sz_r + ys * cz_r
+        c_, s_ = math.cos(az), math.sin(az)
+        nx = xs * c_ - ys * s_; ny = xs * s_ + ys * c_
         xs, ys = nx, ny
 
         # --- Projection ---
@@ -237,52 +303,50 @@ class DotGlobe:
         sx = (xs * radius + cx).astype(np.int32)
         sy = (ys * radius + cy).astype(np.int32)
 
-        # --- Depth-based brightness ---
-        # z ranges roughly -1..1 (before deform stretches it)
         z_norm = (zs - zs.min()) / (zs.max() - zs.min() + 1e-9)
-        bright = (35 + 220 * z_norm).astype(np.float32)  # 35..255 range
+        bright = (35 + 220 * z_norm).astype(np.float32)
 
-        # --- Sort by brightness ascending (so bright dots overwrite dim) ---
         order = np.argsort(bright)
-        sx = sx[order]
-        sy = sy[order]
-        bright = bright[order]
+        sx, sy, bright = sx[order], sy[order], bright[order]
 
         # --- Fade trail ---
-        decay = 0.82 + audio * 0.08  # longer trail when loud (0.82..0.90)
+        decay = 0.82 + audio * 0.08
         self.buf *= decay
 
-        # --- Plot dots with glow ---
+        # --- Background strokes (draw before globe) ---
+        for stroke in self.strokes:
+            stroke.update(w, h)
+            a = stroke.alpha
+            if a < 0.05:
+                continue
+            x0, y0, x1, y1 = stroke.endpoints()
+            draw_line_buf(self.buf, x0, y0, x1, y1, stroke.brightness * a, h, w)
+
+        # --- Plot globe dots ---
         new_frame = np.zeros((h, w), dtype=np.float32)
 
         for dx, dy, falloff in self._kernel_3:
-            gx = sx + dx
-            gy = sy + dy
+            gx = sx + dx; gy = sy + dy
             v = (gx >= 0) & (gx < w) & (gy >= 0) & (gy < h)
             np.maximum.at(new_frame, (gy[v], gx[v]), bright[v] * falloff)
 
-        # Extra outer glow for front-facing dots
         front = bright > 150
         if np.any(front):
-            fsx = sx[front]
-            fsy = sy[front]
-            fbr = bright[front]
+            fsx, fsy, fbr = sx[front], sy[front], bright[front]
             for dx, dy, falloff in self._kernel_5:
-                gx = fsx + dx
-                gy = fsy + dy
+                gx = fsx + dx; gy = fsy + dy
                 v = (gx >= 0) & (gx < w) & (gy >= 0) & (gy < h)
                 np.maximum.at(new_frame, (gy[v], gx[v]), fbr[v] * falloff)
 
-        # --- Merge with trail ---
         np.maximum(self.buf, new_frame, out=self.buf)
         np.clip(self.buf, 0, 255, out=self.buf)
 
-        # --- Convert to RGB with cool blue tint ---
+        # --- RGB with cool blue tint ---
         g = np.clip(self.buf, 0, 255).astype(np.uint8)
         rgb = np.zeros((h, w, 3), dtype=np.uint8)
-        rgb[:, :, 0] = (g * 0.82).astype(np.uint8)   # R: dimmer
-        rgb[:, :, 1] = (g * 0.92).astype(np.uint8)   # G: mid
-        rgb[:, :, 2] = g                               # B: full
+        rgb[:, :, 0] = (g * 0.82).astype(np.uint8)
+        rgb[:, :, 1] = (g * 0.92).astype(np.uint8)
+        rgb[:, :, 2] = g
 
         return Image.fromarray(rgb)
 
@@ -377,6 +441,11 @@ class JarvisApp:
         self._photo = None
         self._img_id = None
 
+        # Sidebar bar item IDs (pre-created)
+        self._bar_ids = []
+        self._bar_glow_ids = []
+        self._bar_peak = [0.0] * 8  # peak hold per band
+
         self.audio = AudioCapture()
         self.audio.start()
 
@@ -387,7 +456,7 @@ class JarvisApp:
 
     # --------------------------------------------------------------- UI
     def _build_ui(self):
-        # Title bar
+        # ---- Title bar ----
         tb = tk.Frame(self.root, bg=Col.bg2, height=TITLE_H)
         tb.pack(fill=tk.X, side=tk.TOP)
         tb.pack_propagate(False)
@@ -395,109 +464,217 @@ class JarvisApp:
         tb.bind("<B1-Motion>", self._dm)
 
         lf = tk.Frame(tb, bg=Col.bg2)
-        lf.pack(side=tk.LEFT, padx=16)
+        lf.pack(side=tk.LEFT, padx=14)
         lf.bind("<Button-1>", self._ds)
         lf.bind("<B1-Motion>", self._dm)
 
         tk.Label(lf, text="◆", font=("Consolas", 9), fg=Col.muted,
-                 bg=Col.bg2).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(lf, text="E.C.H.O.", font=("Consolas", 11, "bold"),
+                 bg=Col.bg2).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(lf, text="E.C.H.O.", font=("Consolas", 10, "bold"),
                  fg=Col.accent, bg=Col.bg2).pack(side=tk.LEFT)
-        tk.Label(lf, text="v3.0", font=("Consolas", 8), fg=Col.muted,
-                 bg=Col.bg2).pack(side=tk.LEFT, padx=(8, 0))
 
+        # Clock
+        self.clock_lbl = tk.Label(
+            tb, text="", font=("Consolas", 9), fg=Col.muted, bg=Col.bg2)
+        self.clock_lbl.pack(side=tk.RIGHT, padx=(0, 8))
+        # Separator dot before clock
+        tk.Label(tb, text="◇", font=("Consolas", 7), fg=Col.dim,
+                 bg=Col.bg2).pack(side=tk.RIGHT, padx=(0, 6))
+
+        # Window controls
         rf = tk.Frame(tb, bg=Col.bg2)
-        rf.pack(side=tk.RIGHT, padx=12)
+        rf.pack(side=tk.RIGHT, padx=(0, 8))
         for txt, cmd, hc in [("—", lambda: self.root.iconify(), Col.accent2),
                               ("✕", self._quit, Col.danger)]:
-            b = tk.Label(rf, text=f" {txt} ", font=("Consolas", 11),
+            b = tk.Label(rf, text=f" {txt} ", font=("Consolas", 10),
                          fg=Col.muted, bg=Col.bg2, cursor="hand2")
-            b.pack(side=tk.LEFT, padx=2)
+            b.pack(side=tk.LEFT, padx=1)
             b.bind("<Button-1>", lambda e, c=cmd: c())
             b.bind("<Enter>", lambda e, w=b, c=hc: w.config(fg=c))
             b.bind("<Leave>", lambda e, w=b: w.config(fg=Col.muted))
 
         tk.Frame(self.root, bg=Col.border, height=1).pack(fill=tk.X)
 
-        # Canvas
-        self.canvas = tk.Canvas(self.root, bg=Col.bg, highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        # ---- Middle area: sidebar + canvas ----
+        mid = tk.Frame(self.root, bg=Col.bg)
+        mid.pack(fill=tk.BOTH, expand=True)
 
-        # Bottom panel
+        # Left sidebar (audio visualizer)
+        self.sidebar = tk.Canvas(
+            mid, bg=Col.sidebar, width=SIDEBAR_W, highlightthickness=0)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Thin separator between sidebar and canvas
+        tk.Frame(mid, bg=Col.border, width=1).pack(side=tk.LEFT, fill=tk.Y)
+
+        # Main canvas
+        self.canvas = tk.Canvas(mid, bg=Col.bg, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+
+        # ---- Bottom panel ----
         bp = tk.Frame(self.root, bg=Col.panel, height=PANEL_H)
         bp.pack(fill=tk.X, side=tk.BOTTOM)
         bp.pack_propagate(False)
 
         # Dashed separator
         dc = tk.Canvas(bp, bg=Col.panel, height=1, highlightthickness=0)
-        dc.pack(fill=tk.X, padx=40, pady=(10, 0))
+        dc.pack(fill=tk.X, padx=36, pady=(8, 0))
         dc.create_line(0, 0, WIN_W, 0, fill=Col.dim, width=1, dash=(4, 4))
 
         # Response
         rf2 = tk.Frame(bp, bg=Col.panel)
-        rf2.pack(fill=tk.X, padx=44, pady=(8, 3))
-        self.resp = tk.Label(rf2, text="", font=("Consolas", 10), fg=Col.accent2,
+        rf2.pack(fill=tk.X, padx=40, pady=(6, 2))
+        self.resp = tk.Label(rf2, text="", font=("Consolas", 9), fg=Col.accent2,
                              bg=Col.panel, anchor="w", justify="left",
-                             wraplength=WIN_W - 120)
+                             wraplength=WIN_W - 110)
         self.resp.pack(fill=tk.X)
 
         # Status
         sr2 = tk.Frame(bp, bg=Col.panel)
-        sr2.pack(fill=tk.X, padx=44, pady=(0, 5))
+        sr2.pack(fill=tk.X, padx=40, pady=(0, 4))
         self.sdot = tk.Canvas(sr2, width=8, height=8, bg=Col.panel,
                               highlightthickness=0)
         self.sdot.pack(side=tk.LEFT)
         self.sdot_id = self.sdot.create_oval(1, 1, 7, 7, fill=Col.green, outline="")
-        self.slbl = tk.Label(sr2, text="ONLINE", font=("Consolas", 8, "bold"),
+        self.slbl = tk.Label(sr2, text="ONLINE", font=("Consolas", 7, "bold"),
                              fg=Col.muted, bg=Col.panel)
         self.slbl.pack(side=tk.LEFT, padx=(6, 0))
 
-        # Mic meter
-        mf = tk.Frame(sr2, bg=Col.panel)
-        mf.pack(side=tk.RIGHT)
-        tk.Label(mf, text="MIC", font=("Consolas", 7, "bold"), fg=Col.dim,
-                 bg=Col.panel).pack(side=tk.LEFT, padx=(0, 6))
-        self.mcv = tk.Canvas(mf, width=80, height=4, bg=Col.panel,
-                             highlightthickness=0)
-        self.mcv.pack(side=tk.LEFT)
-        self.mcv.create_rectangle(0, 0, 80, 4, fill=Col.border, outline="")
-        self.mbar = self.mcv.create_rectangle(0, 0, 0, 4, fill=Col.muted, outline="")
-
         # Input
         irow = tk.Frame(bp, bg=Col.panel)
-        irow.pack(fill=tk.X, padx=44, pady=(2, 16))
+        irow.pack(fill=tk.X, padx=40, pady=(2, 12))
         self.ib = tk.Frame(irow, bg=Col.dim, padx=1, pady=1)
         self.ib.pack(fill=tk.X)
         ii = tk.Frame(self.ib, bg=Col.bg)
         ii.pack(fill=tk.X)
 
-        tk.Label(ii, text="  >", font=("Consolas", 13, "bold"), fg=Col.muted,
-                 bg=Col.bg).pack(side=tk.LEFT, padx=(6, 0))
-        self.entry = tk.Entry(ii, font=("Consolas", 12), bg=Col.bg, fg=Col.accent,
+        tk.Label(ii, text="  >", font=("Consolas", 12, "bold"), fg=Col.muted,
+                 bg=Col.bg).pack(side=tk.LEFT, padx=(4, 0))
+        self.entry = tk.Entry(ii, font=("Consolas", 11), bg=Col.bg, fg=Col.accent,
                               insertbackground=Col.accent, relief="flat", border=0)
-        self.entry.pack(fill=tk.X, padx=(4, 12), pady=11, side=tk.LEFT, expand=True)
+        self.entry.pack(fill=tk.X, padx=(4, 10), pady=9, side=tk.LEFT, expand=True)
         self.entry.bind("<Return>", self._on_submit)
         self.entry.bind("<FocusIn>",
                         lambda e: (self._clr_ph(), self.ib.config(bg=Col.accent2)))
         self.entry.bind("<FocusOut>", lambda e: self.ib.config(bg=Col.dim))
 
-        self.mic_btn = tk.Label(ii, text="◉", font=("Consolas", 14), fg=Col.muted,
+        self.mic_btn = tk.Label(ii, text="◉", font=("Consolas", 13), fg=Col.muted,
                                 bg=Col.bg, cursor="hand2")
-        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.mic_btn.bind("<Button-1>", self._on_mic)
         self.mic_btn.bind("<Enter>", lambda e: self.mic_btn.config(fg=Col.accent2))
         self.mic_btn.bind("<Leave>", lambda e: self.mic_btn.config(
             fg=Col.muted if not self.is_listening else Col.danger))
 
-        snd = tk.Label(ii, text="→", font=("Consolas", 16, "bold"), fg=Col.muted,
+        snd = tk.Label(ii, text="→", font=("Consolas", 14, "bold"), fg=Col.muted,
                        bg=Col.bg, cursor="hand2")
-        snd.pack(side=tk.RIGHT, padx=(0, 4))
+        snd.pack(side=tk.RIGHT, padx=(0, 3))
         snd.bind("<Button-1>", self._on_submit)
         snd.bind("<Enter>", lambda e: snd.config(fg=Col.accent))
         snd.bind("<Leave>", lambda e: snd.config(fg=Col.muted))
 
         self._set_ph()
 
+    # ---- Sidebar: pre-create bar items after layout ----
+    def _init_sidebar(self):
+        sb = self.sidebar
+        sw = SIDEBAR_W
+        sh = sb.winfo_height()
+        if sh < 50:
+            return
+
+        # "AUDIO" label at top
+        sb.create_text(sw // 2, 12, text="AUDIO", font=("Consolas", 6, "bold"),
+                       fill=Col.muted, anchor="center")
+
+        # 8 frequency bars stacked vertically, bottom to top
+        # Each bar: background slot + fill bar + peak dot + glow
+        bar_area_top = 26
+        bar_area_bot = sh - 8
+        total_h = bar_area_bot - bar_area_top
+        bar_h = total_h / 8
+        bar_w = 14
+        bar_x = (sw - bar_w) // 2
+
+        self._bar_area_top = bar_area_top
+        self._bar_h = bar_h
+        self._bar_x = bar_x
+        self._bar_w = bar_w
+
+        # Band labels (low freq at bottom)
+        labels = ["SUB", "BAS", "LOW", "MID", "HMD", "HI", "TRB", "AIR"]
+
+        for i in range(8):
+            y_top = bar_area_top + i * bar_h + 2
+            y_bot = y_top + bar_h - 4
+
+            # Background slot
+            sb.create_rectangle(bar_x, y_top, bar_x + bar_w, y_bot,
+                                fill="#0e0e0e", outline=Col.border)
+
+            # Glow rectangle (behind fill)
+            glow_id = sb.create_rectangle(bar_x - 3, y_bot, bar_x + bar_w + 3, y_bot,
+                                          fill="", outline="")
+            self._bar_glow_ids.append(glow_id)
+
+            # Fill bar (starts at bottom, grows up)
+            bar_id = sb.create_rectangle(bar_x + 1, y_bot, bar_x + bar_w - 1, y_bot,
+                                         fill=Col.cyan_dim, outline="")
+            self._bar_ids.append(bar_id)
+
+            # Label (right side, rotated by placing vertically)
+            label_idx = 7 - i  # reverse: bottom = sub, top = air
+            sb.create_text(bar_x + bar_w + 10, (y_top + y_bot) / 2,
+                           text=labels[label_idx], font=("Consolas", 5),
+                           fill=Col.dim, anchor="w")
+
+        self._sidebar_ready = True
+
+    def _update_sidebar(self, bands, audio):
+        """Update the 8 frequency bars."""
+        sb = self.sidebar
+        for i in range(8):
+            band_idx = 7 - i  # bottom bar = band 0 (sub), top = band 7 (air)
+            level = min(1.0, bands[band_idx] * 2.5)
+
+            # Peak hold (slow decay)
+            self._bar_peak[i] = max(self._bar_peak[i] * 0.95, level)
+
+            y_top_slot = self._bar_area_top + i * self._bar_h + 2
+            y_bot_slot = y_top_slot + self._bar_h - 4
+            fill_h = (y_bot_slot - y_top_slot) * level
+            fill_top = y_bot_slot - fill_h
+
+            # Update fill bar
+            sb.coords(self._bar_ids[i],
+                      self._bar_x + 1, fill_top,
+                      self._bar_x + self._bar_w - 1, y_bot_slot)
+
+            # Color based on level
+            if level > 0.6:
+                col = "#00ffcc"  # hot green-cyan
+            elif level > 0.3:
+                col = Col.cyan   # bright cyan
+            elif level > 0.1:
+                col = Col.cyan_dim
+            else:
+                col = "#0a1a1e"
+            sb.itemconfig(self._bar_ids[i], fill=col)
+
+            # Glow: wider rect behind bar when active
+            if level > 0.15:
+                glow_h = fill_h * 0.6
+                glow_top = y_bot_slot - glow_h
+                sb.coords(self._bar_glow_ids[i],
+                          self._bar_x - 4, glow_top,
+                          self._bar_x + self._bar_w + 4, y_bot_slot)
+                gv = int(min(30, level * 40))
+                sb.itemconfig(self._bar_glow_ids[i],
+                              fill=f"#00{gv:02x}{gv:02x}", outline="")
+            else:
+                sb.coords(self._bar_glow_ids[i], 0, 0, 0, 0)
+
+    # ---- Helpers ----
     def _set_ph(self):
         if not self.entry.get():
             self.entry.insert(0, "Type a command...")
@@ -587,13 +764,14 @@ class JarvisApp:
         self._cw = cw
         self._ch = ch
         self._ready = True
+        self._sidebar_ready = False
 
     # --------------------------------------------------------------- Animate
     def _animate(self):
         self.tick += 1
         t = self.tick / FPS
 
-        # Audio smooth
+        # Audio
         raw = self.audio.rms if self.audio.running else 0.0
         self.audio_smooth = lerp(self.audio_smooth, min(raw * 5, 1.0), 0.12)
         a = self.audio_smooth
@@ -606,7 +784,7 @@ class JarvisApp:
         if self.is_listening:
             a = max(a, 0.2 + 0.1 * math.sin(t * 5))
 
-        # Init on first real frame
+        # Init renderer
         if not self._ready:
             cw = self.canvas.winfo_width()
             ch = self.canvas.winfo_height()
@@ -616,34 +794,40 @@ class JarvisApp:
                 self.root.after(50, self._animate)
                 return
 
-        # Render globe
+        # Init sidebar bars (once, after layout)
+        if not self._sidebar_ready:
+            self._init_sidebar()
+
+        # ---- Clock ----
+        now = datetime.now()
+        self.clock_lbl.config(text=now.strftime("%H:%M:%S"))
+
+        # ---- Render globe + background strokes ----
         img = self.globe.render(t, a, self.bands_smooth)
         self._photo.paste(img)
 
-        # Clear overlays
+        # ---- Canvas overlays ----
         self.canvas.delete("ov")
 
         cw, ch = self._cw, self._ch
         dcx, dcy = cw // 2, ch // 2
         sphere_r = min(cw, ch) * 0.37
 
-        # Orbital ring (dashed, outside the globe)
-        r1 = sphere_r + 25 + a * 10 + math.sin(t * 0.5) * 3
+        # Orbital rings
+        r1 = sphere_r + 20 + a * 8 + math.sin(t * 0.5) * 3
         self.canvas.create_oval(
-            dcx - r1, dcy - r1, dcx + r1, dcy + r1,
+            dcx-r1, dcy-r1, dcx+r1, dcy+r1,
             outline=Col.dim, width=1, dash=(3, 8), tags=("ov",))
 
-        r2 = sphere_r + 55 + a * 15 + math.sin(t * 0.7) * 4
+        r2 = sphere_r + 45 + a * 12 + math.sin(t * 0.7) * 4
         self.canvas.create_oval(
-            dcx - r2, dcy - r2, dcx + r2, dcy + r2,
+            dcx-r2, dcy-r2, dcx+r2, dcy+r2,
             outline="#181818", width=1, dash=(2, 10), tags=("ov",))
 
-        # Rotating tick marks on outer ring
-        n_ticks = 32
-        for i in range(n_ticks):
-            angle = (i / n_ticks) * math.tau + t * 0.2
-            ri = r2 - 4
-            ro = r2 + 4
+        # Tick marks
+        for i in range(28):
+            angle = (i / 28) * math.tau + t * 0.2
+            ri, ro = r2 - 3, r2 + 3
             x1 = dcx + math.cos(angle) * ri
             y1 = dcy + math.sin(angle) * ri
             x2 = dcx + math.cos(angle) * ro
@@ -652,29 +836,22 @@ class JarvisApp:
             self.canvas.create_line(x1, y1, x2, y2, fill=c, width=1, tags=("ov",))
 
         # Dot-matrix text
-        ly = dcy + sphere_r + 45
+        ly = dcy + sphere_r + 35
         draw_dot_text(self.canvas, "E.C.H.O.", dcx, ly,
-                      dot=2.8, sp=1.3, color=Col.dot_on, ghost="")
+                      dot=2.4, sp=1.3, color=Col.dot_on, ghost="")
 
-        # State
         if self.is_listening:
             st, sc = "LISTENING", Col.danger
         elif self.is_thinking:
             st, sc = "PROCESSING", Col.warning
         else:
             st, sc = "READY", Col.muted
-        draw_dot_text(self.canvas, st, dcx, ly + 28,
-                      dot=1.5, sp=1.2, color=sc, ghost="")
+        draw_dot_text(self.canvas, st, dcx, ly + 24,
+                      dot=1.3, sp=1.2, color=sc, ghost="")
 
-        # Mic meter
-        bw = int(a * 80)
-        self.mcv.coords(self.mbar, 0, 0, bw, 4)
-        if a > 0.3:
-            self.mcv.itemconfig(self.mbar, fill=Col.green)
-        elif a > 0.1:
-            self.mcv.itemconfig(self.mbar, fill=Col.accent2)
-        else:
-            self.mcv.itemconfig(self.mbar, fill=Col.dim)
+        # ---- Sidebar update ----
+        if self._sidebar_ready:
+            self._update_sidebar(self.bands_smooth, a)
 
         # Status dot pulse
         if self.is_thinking or self.is_listening:
