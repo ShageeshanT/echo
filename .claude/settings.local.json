@@ -3,7 +3,9 @@
     "allow": [
       "Bash(pip list:*)",
       "Bash(timeout 5 python jarvis.py)",
-      "Bash(timeout 8 python jarvis.py)"
+      "Bash(timeout 8 python jarvis.py)",
+      "Bash(timeout 6 python jarvis.py)",
+      "Bash(timeout 7 python jarvis.py)"
     ]
   }
 }
