@@ -1,0 +1,15 @@
+# --- Core (existing) ---
+faster-whisper
+pyaudio
+numpy
+Pillow
+requests
+pygame
+SpeechRecognition
+edge-tts
+pyttsx3
+psutil
+
+# --- Phase 1: persistence + LLM brain backbone ---
+chromadb              # local vector DB (replaces Pinecone), uses ONNX runtime — no torch
+google-generativeai   # Gemini 2.0 Flash for vision + agentic tool calling
