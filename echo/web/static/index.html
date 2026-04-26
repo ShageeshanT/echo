@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E.C.H.O.</title>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <span class="diamond">◆</span>
+            <span class="name">E.C.H.O.</span>
+            <span class="sep">//</span>
+            <span class="subtitle">Enhanced Cognitive Heuristic Operator</span>
+        </div>
+        <div class="status-pill">
+            <span id="status-dot" class="dot"></span>
+            <span id="status-text">connecting…</span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Globe / visualization area (Three.js will mount here later) -->
+        <section id="globe-stage">
+            <div id="globe-placeholder">
+                <div class="ring r1"></div>
+                <div class="ring r2"></div>
+                <div class="ring r3"></div>
+                <div id="rms-bar"><div id="rms-fill"></div></div>
+                <div class="echo-label">E.C.H.O.</div>
+            </div>
+        </section>
+
+        <!-- Live event feed (transcripts, memories, action items) -->
+        <aside id="feed">
+            <div class="feed-section">
+                <div class="feed-title">TRANSCRIPTS</div>
+                <ul id="transcript-list"></ul>
+            </div>
+            <div class="feed-section">
+                <div class="feed-title">MEMORIES</div>
+                <ul id="memory-list"></ul>
+            </div>
+            <div class="feed-section">
+                <div class="feed-title">ACTION ITEMS</div>
+                <ul id="action-list"></ul>
+            </div>
+        </aside>
+    </main>
+
+    <!-- Response display + input bar -->
+    <footer>
+        <div id="response" class="response empty"></div>
+
+        <form id="input-form" autocomplete="off">
+            <span class="prompt">&gt;_</span>
+            <input id="input" type="text" placeholder="ask echo something..."
+                   autocomplete="off" spellcheck="false">
+            <button id="mic-btn" type="button" title="hold to talk">◉</button>
+            <button id="send-btn" type="submit" title="send">↵</button>
+        </form>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

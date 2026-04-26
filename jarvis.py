@@ -16,6 +16,8 @@ except Exception:
 
 # Load config (.env, feature flags, pygame.mixer init) before anything else.
 from echo import config  # noqa: F401, E402
+# Importing workers registers the bus subscribers (transcriber + persistence).
+from echo import workers  # noqa: F401, E402
 from echo.ui.app import JarvisApp  # noqa: E402
 
 

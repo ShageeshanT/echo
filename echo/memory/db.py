@@ -27,8 +27,20 @@ def _connect() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
+        # Migrate FIRST so existing tables grow new columns BEFORE _init_schema
+        # runs CREATE INDEX statements that reference those columns.
+        _migrate(_conn)
         _init_schema(_conn)
     return _conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Light schema migrations for existing DBs. Idempotent."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(transcripts)").fetchall()}
+    if "processed_at" not in cols and cols:
+        # Column missing on a pre-Phase-3b DB — add it.
+        conn.execute("ALTER TABLE transcripts ADD COLUMN processed_at REAL")
+        conn.commit()
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
@@ -76,9 +88,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             text TEXT NOT NULL,
             ts REAL NOT NULL,
             speaker TEXT,
-            window_app TEXT
+            window_app TEXT,
+            processed_at REAL          -- when post-processor extracted from this row
         );
         CREATE INDEX IF NOT EXISTS idx_transcripts_ts ON transcripts(ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_unprocessed
+            ON transcripts(processed_at) WHERE processed_at IS NULL;
 
         CREATE TABLE IF NOT EXISTS screen_events (
             id TEXT PRIMARY KEY,
@@ -166,6 +181,68 @@ def open_action_items() -> List[Dict[str, Any]]:
             "SELECT id, content, due_at, created_at FROM action_items WHERE done=0 ORDER BY created_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def insert_transcript(text: str, ts: Optional[float] = None,
+                      speaker: Optional[str] = None,
+                      window_app: Optional[str] = None) -> str:
+    tid = _new_id()
+    if ts is None:
+        ts = time.time()
+    with _LOCK:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO transcripts (id, text, ts, speaker, window_app) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tid, text, ts, speaker, window_app),
+        )
+        conn.commit()
+    return tid
+
+
+def recent_transcripts(limit: int = 50) -> List[Dict[str, Any]]:
+    with _LOCK:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT id, text, ts, speaker, window_app "
+            "FROM transcripts ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def transcript_count() -> int:
+    with _LOCK:
+        conn = _connect()
+        row = conn.execute("SELECT COUNT(*) AS n FROM transcripts").fetchone()
+    return int(row["n"])
+
+
+def unprocessed_transcripts(limit: int = 30) -> List[Dict[str, Any]]:
+    """Transcripts the post-processor hasn't extracted from yet, oldest first."""
+    with _LOCK:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT id, text, ts, speaker, window_app FROM transcripts "
+            "WHERE processed_at IS NULL ORDER BY ts ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_transcripts_processed(ids: List[str]) -> int:
+    """Mark a batch of transcripts as having been post-processed."""
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    with _LOCK:
+        conn = _connect()
+        cur = conn.execute(
+            f"UPDATE transcripts SET processed_at=? WHERE id IN ({placeholders})",
+            (time.time(), *ids),
+        )
+        conn.commit()
+    return cur.rowcount
 
 
 def close() -> None:

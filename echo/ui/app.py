@@ -19,6 +19,7 @@ from echo import state
 from echo.brain import call_ai_backend, history
 from echo.capture import AudioCapture
 from echo.config import PYGAME_OK, SLEEP_TIMEOUT
+from echo.workers import transcriber
 from echo.context.desktop import get_desktop_context
 from echo.context.greeting import build_wake_greeting
 from echo.context.system_health import get_system_health
@@ -323,6 +324,10 @@ class JarvisApp:
         if not self.is_sleeping:
             return
         self.is_sleeping = False
+        # Tell capture/audio.py to stop running wake-word whisper now that
+        # we're online. The always-on transcriber stays disabled until the
+        # greeting finishes (otherwise it would record our own TTS).
+        state.set_sleeping(False)
         self._waking_up = True
         self._brightness_target = 1.0
         self._stat("WAKING UP", "wake")
@@ -376,6 +381,9 @@ class JarvisApp:
                     speak_pyttsx3(greeting)
 
             self._waking_up = False
+            # Greeting finished — start always-on capture. Any speech in the
+            # room from now on flows: mic -> bus -> transcriber -> SQLite.
+            transcriber.enable()
             self.root.after(0, lambda: self._stat("ONLINE", "idle"))
 
         threading.Thread(target=_wake_thread, daemon=True).start()
@@ -383,6 +391,11 @@ class JarvisApp:
     def _go_to_sleep(self):
         if self.is_sleeping:
             return
+        # Stop always-on capture FIRST, then mark sleeping. Order matters:
+        # the transcriber's _on_chunk also checks state.is_sleeping, so this
+        # double-gate is belt-and-suspenders.
+        transcriber.disable()
+        state.set_sleeping(True)
         self.is_sleeping = True
         self._waking_up = False
         self._brightness_target = 0.15
@@ -467,6 +480,10 @@ class JarvisApp:
     def _on_mic(self, e=None):
         if self.is_sleeping or self.is_listening or self.is_thinking:
             return
+        # Pause always-on capture for the duration of the mic press —
+        # voice_to_text opens its own 16kHz stream and we don't want both
+        # paths transcribing the same words.
+        transcriber.disable()
         self.is_listening = True
         self.last_interaction = time.time()
         self.mic_btn.config(fg=C.danger)
@@ -481,6 +498,9 @@ class JarvisApp:
     def _vdone(self, text):
         self.is_listening = False
         self.mic_btn.config(fg=C.muted)
+        # Resume always-on capture if we're still online.
+        if not self.is_sleeping:
+            transcriber.enable()
         if text:
             self.entry.delete(0, tk.END)
             self.entry.config(fg=C.accent)
@@ -637,6 +657,7 @@ class JarvisApp:
         self.root.after(FRAME_MS, self._animate)
 
     def _quit(self):
+        transcriber.disable()
         self.audio.stop()
         if PYGAME_OK:
             try:

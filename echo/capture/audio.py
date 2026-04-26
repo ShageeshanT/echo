@@ -17,9 +17,10 @@ import time
 
 import numpy as np
 
-from echo import bus
+from echo import bus, state
 from echo.config import AUDIO_OK, MIC_DEVICE_INDEX
-from echo.stt.whisper import get_model
+from echo.log import log
+from echo.stt.whisper import get_model, transcribe_audio
 
 if AUDIO_OK:
     import pyaudio
@@ -57,12 +58,33 @@ class AudioCapture:
     def _loop(self):
         try:
             pa = pyaudio.PyAudio()
+            log("capture", f"opening AudioCapture stream on device_index={MIC_DEVICE_INDEX} "
+                f"@ 44100Hz, 2048 frames/buf")
             st = pa.open(format=pyaudio.paInt16, channels=1, rate=44100,
                          input=True, input_device_index=MIC_DEVICE_INDEX,
                          frames_per_buffer=2048)
+            log("capture", "AudioCapture stream open, entering loop")
+
+            # Wall-clock pacer — some Windows drivers (Intel Smart Sound, in
+            # particular) return pyaudio.read() instantly with stale/buffered
+            # data instead of blocking at the audio rate. That breaks whisper
+            # and the always-on transcriber, since the buffer fills with
+            # ~30s of "audio" in <1s of wall time. We enforce ~22Hz manually:
+            # if a read is too fast, sleep until the next 46ms boundary.
+            EXPECTED_DT = 2048 / 44100.0       # 46.4ms per chunk
+            next_deadline = time.time()
+            read_size_logged = 0
+
             while self.running:
                 data = st.read(2048, exception_on_overflow=False)
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+                # First few reads: log byte count so we can confirm pyaudio
+                # is producing 4096 bytes (2048 * 2) per read.
+                if read_size_logged < 5:
+                    log("capture", f"st.read returned {len(data)} bytes "
+                        f"(expected 4096 = 2048 frames * 2 bytes)")
+                    read_size_logged += 1
+                samples_int16 = np.frombuffer(data, dtype=np.int16)
+                samples = samples_int16.astype(np.float64)
                 self.rms = float(np.sqrt(np.mean(samples ** 2)) / 32768)
 
                 # FFT bands for visualizer
@@ -72,6 +94,13 @@ class AudioCapture:
                     float(np.mean(fft[i * bs:(i + 1) * bs])) / 40000 for i in range(8)
                 ]
                 bus.publish("audio.rms", self.rms)
+                # Raw chunk feed for downstream subscribers (always-on
+                # transcriber, future plugins). Synchronous dispatch — keep
+                # subscriber callbacks light or hand off to a thread.
+                # `.copy()` because samples_int16 is a view into the bytes
+                # object returned by stream.read; subscribers may store the
+                # array beyond this iteration.
+                bus.publish("audio.chunk", samples_int16.copy())
 
                 now = time.time()
                 full_fft = np.abs(np.fft.rfft(samples))
@@ -129,7 +158,10 @@ class AudioCapture:
                     self._whistle_frames = max(0, self._whistle_frames - 1)
 
                 # ========== WAKE WORD: "hey echo" ==========
-                whisper_model = get_model()
+                # Only run when sleeping. While online, the always-on
+                # transcriber owns whisper inference — running both wastes
+                # CPU and competes for the model lock.
+                whisper_model = get_model() if state.is_sleeping else None
                 if self.rms > 0.008 and whisper_model is not None:
                     self._wake_buf.append(samples.copy())
                     self._wake_buf_frames += 1
@@ -145,13 +177,13 @@ class AudioCapture:
                     self._wake_buf_frames = 0
                     self._wake_checking = True
 
-                    def _check_wake(audio_chunks, model):
+                    def _check_wake(audio_chunks):
                         try:
                             audio_np = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
-                            segments, _ = model.transcribe(
-                                audio_np, beam_size=1, language="en", vad_filter=True,
-                            )
-                            text = " ".join(s.text for s in segments).lower().strip()
+                            text = (transcribe_audio(
+                                audio_np, source_sr=44100, vad_filter=False,
+                                debug_label="wake_word",
+                            ) or "").lower().strip()
                             wake_phrases = ["hey echo", "hey eco", "hey eko",
                                             "hey iko", "a echo", "hey e cho",
                                             "hey ekko"]
@@ -168,13 +200,29 @@ class AudioCapture:
                         finally:
                             self._wake_checking = False
 
-                    threading.Thread(target=_check_wake, args=(buf_copy, whisper_model), daemon=True).start()
+                    threading.Thread(target=_check_wake, args=(buf_copy,), daemon=True).start()
 
                 if len(self._wake_buf) > 60:
                     self._wake_buf = self._wake_buf[-30:]
 
+                # Throttle to 22Hz wall-clock max. If pyaudio is blocking
+                # properly this is a no-op (sleep_amt <= 0). If pyaudio is
+                # returning instantly, we sleep so chunks are published at
+                # the real audio rate.
+                next_deadline += EXPECTED_DT
+                sleep_amt = next_deadline - time.time()
+                if sleep_amt > 0:
+                    time.sleep(sleep_amt)
+                else:
+                    # We're behind schedule — reset deadline to "now" so we
+                    # don't accumulate slip across slow iterations.
+                    next_deadline = time.time()
+
             st.stop_stream()
             st.close()
             pa.terminate()
-        except Exception:
+        except Exception as e:
+            log("capture", f"AudioCapture loop error — {e!r}. "
+                f"Mic device_index={MIC_DEVICE_INDEX} may be wrong; "
+                f"try `python scripts/diagnose.py`.")
             self.running = False
