@@ -1,8 +1,8 @@
 """
 Brain — LLM orchestration.
 
-Phase 1: keyword intent first, then Groq for everything else (current behavior).
-Phase 4: replace with full LLM tool calling — same module, swap implementations.
+Phase 3: memory-augmented chat (ChromaDB context injection).
+Phase 4: LLM tool calling (Groq 70B with structured tools).
 """
 
 from echo.brain.groq_client import call_ai_backend  # noqa: F401

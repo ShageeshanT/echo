@@ -1,68 +1,25 @@
 """
-Keyword intent dispatch — the pre-LLM filter from the original `call_ai_backend`.
+Keyword intent dispatch — deterministic fast-path for commands that must be
+instant (no LLM round-trip latency).
 
-Returns a string response for handled intents, or None to fall through to the
-LLM. Two sentinel strings — "__SLEEP__" and "__EXIT__" — are returned for
-state transitions the UI handles.
-
-This whole module gets replaced in Phase 4 by LLM tool calling, but the
-underlying handlers (apps, browser, system) stay.
+Phase 4 moved YouTube, app launch, web search, time, and date to LLM tool
+calling. This module now only handles:
+  - Mute/unmute (hardware toggle, must be instant)
+  - Sleep/exit sentinels (state transitions the UI handles)
 """
-from echo.actions import apps, browser, system
+from echo.actions import system
 
 
 def dispatch(user_text: str) -> str | None:
     lower = user_text.lower().strip()
 
-    # Play something on YouTube — checked BEFORE generic open commands so
-    # "play me a song on YouTube" doesn't fall into the YouTube-opener branch.
-    if any(w in lower for w in ["play", "put on", "play me"]):
-        query = lower
-        for prefix in ["play me", "play", "put on", "on youtube", "in youtube",
-                       "youtube", "a song", "song", "some", "the", "open", "and"]:
-            query = query.replace(prefix, "").strip()
-        if query:
-            browser.play_youtube(query)
-            return f"Playing {query} on YouTube."
-
-    # App / URL launchers
-    if any(w in lower for w in ["open", "launch", "start", "run"]):
-        for keywords, cmd, name, use_brave in apps.APP_MAP:
-            if any(kw in lower for kw in keywords):
-                try:
-                    if use_brave:
-                        apps.open_brave(cmd)
-                    else:
-                        apps.open_app(cmd)
-                    return f"Opening {name}."
-                except Exception:
-                    return f"Couldn't open {name}."
-
-    # Web search
-    if any(w in lower for w in ["search for", "google", "look up", "search"]):
-        query = lower
-        for prefix in ["search for", "google", "look up", "search"]:
-            query = query.replace(prefix, "").strip()
-        if query:
-            browser.web_search(query)
-            return f"Searching for {query}."
-
-    # Time
-    if "what time" in lower or "current time" in lower or lower == "time":
-        return f"It's {system.current_time()}."
-
-    # Date
-    if "what date" in lower or "today's date" in lower or "what day" in lower:
-        return f"Today's {system.current_date()}."
-
-    # Mute toggle
+    # Mute toggle — must be instant, no LLM latency.
     if "mute" in lower or "unmute" in lower:
         result = system.toggle_mute()
         if result == "muted":
             return "Muted."
         if result == "unmuted":
             return "Unmuted."
-        # On failure, fall through to LLM
 
     # Sleep / exit sentinels
     if any(w in lower for w in ["go to sleep", "sleep mode", "go sleep"]):

@@ -11,7 +11,11 @@ import numpy as np
 from echo.config import (
     AUDIO_OK,
     MIC_DEVICE_INDEX,
+    WHISPER_AVG_LOGPROB_THRESHOLD,
+    WHISPER_BEAM_SIZE,
+    WHISPER_HALLUCINATION_BLACKLIST,
     WHISPER_MODEL_SIZE,
+    WHISPER_NO_SPEECH_THRESHOLD,
     WHISPER_OK,
 )
 from echo.log import log
@@ -102,46 +106,84 @@ def _save_debug_wav(audio_f32, sr: int, label: str) -> "str | None":
         return None
 
 
+def _is_hallucination(text: str) -> bool:
+    """Return True if the transcription matches a known Whisper hallucination."""
+    t = text.lower().strip()
+    if len(t) <= 1:
+        return True
+    for phrase in WHISPER_HALLUCINATION_BLACKLIST:
+        if phrase in t:
+            return True
+    # Repetition detector — same word 3+ times in a row = decode loop
+    words = t.split()
+    if len(words) >= 6:
+        for i in range(len(words) - 2):
+            if words[i] == words[i + 1] == words[i + 2]:
+                return True
+    return False
+
+
 def transcribe_audio(audio_np, source_sr: int = 16000,
                      vad_filter: bool = False,
-                     debug_label: str = "unknown") -> "str | None":
+                     debug_label: str = "unknown",
+                     min_words: int = 0) -> "str | None":
     """Thread-safe transcription. Takes a float32 numpy array.
 
     Args:
         audio_np    : float32 mono samples, any sample rate
-        source_sr   : sample rate of audio_np. We resample to 16kHz before
-                      handing to faster-whisper, which is what it expects
-                      for numpy input.
-        vad_filter  : enable Silero VAD pre-filter inside whisper. Default
-                      OFF — both call sites already gate on intent (mic
-                      press) or RMS (always-on), and the VAD pre-filter
-                      can drop legitimate speech aggressively.
-        debug_label : tag for the debug-on-failure wav dump so we can
-                      tell which call site produced bad audio.
+        source_sr   : sample rate of audio_np. Resampled to 16kHz internally.
+        vad_filter  : enable Silero VAD pre-filter. True for always-on mic
+                      paths (web, background transcriber). False for
+                      user-initiated recording (mic button press).
+        debug_label : tag for debug wav dumps on failure.
+        min_words   : reject results with fewer words (0 = no filter).
     """
     model = get_model()
     if model is None:
         return None
 
-    # Resample to 16kHz if needed.
     audio_16k = _resample(audio_np, source_sr, 16000)
 
     try:
         with model_lock:
-            segments, _ = model.transcribe(
-                audio_16k, beam_size=1, language="en", vad_filter=vad_filter,
+            segments, info = model.transcribe(
+                audio_16k,
+                beam_size=WHISPER_BEAM_SIZE,
+                language="en",
+                vad_filter=vad_filter,
             )
             segments = list(segments)
-        text = " ".join(seg.text for seg in segments).strip()
-        if text:
-            return text
 
-        # Empty result — save the audio so we can listen to what whisper
-        # actually got. Helps diagnose mic / driver issues.
-        path = _save_debug_wav(audio_16k, 16000, debug_label)
-        if path:
-            log("whisper", f"transcribe returned empty; audio saved to {path}")
-        return None
+        # ── Confidence filtering: reject segments Whisper isn't sure about ──
+        filtered = []
+        for seg in segments:
+            if seg.no_speech_prob > WHISPER_NO_SPEECH_THRESHOLD:
+                log("whisper", f"rejected (no_speech={seg.no_speech_prob:.2f}): {seg.text!r}")
+                continue
+            if seg.avg_logprob < WHISPER_AVG_LOGPROB_THRESHOLD:
+                log("whisper", f"rejected (logprob={seg.avg_logprob:.2f}): {seg.text!r}")
+                continue
+            filtered.append(seg)
+
+        text = " ".join(seg.text for seg in filtered).strip()
+
+        if not text:
+            path = _save_debug_wav(audio_16k, 16000, debug_label)
+            if path:
+                log("whisper", f"all segments filtered out; audio saved to {path}")
+            return None
+
+        # Hallucination blacklist
+        if _is_hallucination(text):
+            log("whisper", f"rejected hallucination: {text!r}")
+            return None
+
+        # Minimum word count
+        if min_words > 0 and len(text.split()) < min_words:
+            log("whisper", f"rejected ({len(text.split())} words < {min_words}): {text!r}")
+            return None
+
+        return text
     except Exception as e:
         log("whisper", f"transcribe error: {e!r}")
         return None

@@ -9,7 +9,14 @@
       "Bash(node -e \"try { require\\('fs'\\).readFileSync\\('echo/web/static/app.js', 'utf8'\\); console.log\\('app.js: readable'\\); } catch\\(e\\) { console.error\\(e\\); }\")",
       "Bash(python -c \"from echo import state; print\\('state import OK, is_sleeping:', state.is_sleeping\\); state.set_sleeping\\(False\\); print\\('set_sleeping OK, is_sleeping:', state.is_sleeping\\)\")",
       "Bash(timeout 10 python -c \"from echo.web.server import app; print\\('server import OK'\\)\")",
-      "Bash(echo \"exit code: $?\")"
+      "Bash(echo \"exit code: $?\")",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(grep -E \"\\(^[^/]*\\\\.py$|/scripts/\\)\")",
+      "Bash(curl -s \"https://console.groq.com/keys\")",
+      "Bash(python -c ' *)",
+      "Bash(timeout 15 python -c ' *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(timeout 15 python -c \"from echo.web.server import app; print\\('server import OK'\\)\")"
     ]
   }
 }

@@ -93,7 +93,7 @@ def _spawn_transcribe(snapshot) -> None:
             log("transcriber", f"flushing utterance, {duration:.1f}s of audio...")
             # AudioCapture records at 44.1kHz — declare it so whisper helper
             # resamples to 16kHz before transcribing.
-            text = transcribe_audio(samples, source_sr=44100, vad_filter=False,
+            text = transcribe_audio(samples, source_sr=44100, vad_filter=True,
                                     debug_label="always_on")
             elapsed = time.time() - t0
             if not text:

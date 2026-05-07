@@ -21,9 +21,9 @@ const STATE = {
     audioCtx: null,
     micStream: null,
     micNode: null,
-    rmsThreshold: 0.012,
-    silenceFramesNeeded: 22,
-    minUtteranceFrames: 16,
+    rmsThreshold: 0.02,              // was 0.012 — rejects keyboard, rustling
+    silenceFramesNeeded: 30,         // was 22 — ~960ms silence confirms end
+    minUtteranceFrames: 25,          // was 16 — ~800ms minimum speech
     maxUtteranceFrames: 480,
     speechBuffer: [],
     silenceFrames: 0,
@@ -32,7 +32,7 @@ const STATE = {
     // 100-200ms of an utterance (consonants are quiet); without pre-roll
     // whisper hears "at time is it" instead of "what time is it".
     preRollBuffer: [],
-    PRE_ROLL_FRAMES: 6,        // ~192ms at 32ms frames
+    PRE_ROLL_FRAMES: 4,              // was 6 — ~128ms, less noise preamble
     listening: false,
     sleeping: true,
     lastInteraction: Date.now(),
@@ -47,6 +47,7 @@ const STATE = {
     ttsActive: false,        // true while audio is playing or queued
     bargeInDebounce: 0,      // ticks remaining before another barge-in fires
     BARGE_IN_DEBOUNCE: 30,   // ~1s of silence before next barge-in (32ms frames)
+    bargeInMultiplier: 2.0,  // was 1.6 inline — now configurable from server
 };
 
 const $ = (id) => document.getElementById(id);
@@ -184,6 +185,15 @@ function handleEvent(m) {
             stopMic();
             $("sub-status").textContent = "MUTED FOR MEDIA — CLICK MIC TO RESUME";
             break;
+        case "vad_config":
+            // Server pushes tuned VAD thresholds at connect time.
+            if (m.rmsThreshold != null) STATE.rmsThreshold = m.rmsThreshold;
+            if (m.silenceFramesNeeded != null) STATE.silenceFramesNeeded = m.silenceFramesNeeded;
+            if (m.minUtteranceFrames != null) STATE.minUtteranceFrames = m.minUtteranceFrames;
+            if (m.preRollFrames != null) STATE.PRE_ROLL_FRAMES = m.preRollFrames;
+            if (m.bargeInMultiplier != null) STATE.bargeInMultiplier = m.bargeInMultiplier;
+            console.log("[vad] config from server:", JSON.stringify(m));
+            break;
     }
 }
 
@@ -301,7 +311,7 @@ function onMicFrame(frame) {
     // Browser's getUserMedia echoCancellation:true should suppress most
     // self-loop from speakers; we additionally use a higher threshold
     // (1.6x) and a debounce so a brief mic spike doesn't kill the audio.
-    if (STATE.ttsActive && isSpeech && rms > STATE.rmsThreshold * 1.6
+    if (STATE.ttsActive && isSpeech && rms > STATE.rmsThreshold * STATE.bargeInMultiplier
         && STATE.bargeInDebounce <= 0) {
         console.log("[barge-in] speech detected during TTS, stopping");
         ttsStopAll();

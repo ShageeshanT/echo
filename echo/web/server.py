@@ -164,6 +164,23 @@ async def ws_endpoint(ws: WebSocket):
     log("web", f"client connected ({len(_clients)} total)")
     await ws.send_text(json.dumps({"type": "status", "value": "sleeping"}))
 
+    # Push tuned VAD thresholds to the browser so they're configurable from .env
+    from echo.config import (
+        WEB_VAD_RMS_THRESHOLD,
+        WEB_VAD_SILENCE_FRAMES,
+        WEB_VAD_MIN_UTTERANCE_FRAMES,
+        WEB_VAD_PRE_ROLL_FRAMES,
+        WEB_VAD_BARGE_IN_MULTIPLIER,
+    )
+    await ws.send_text(json.dumps({
+        "type": "vad_config",
+        "rmsThreshold": WEB_VAD_RMS_THRESHOLD,
+        "silenceFramesNeeded": WEB_VAD_SILENCE_FRAMES,
+        "minUtteranceFrames": WEB_VAD_MIN_UTTERANCE_FRAMES,
+        "preRollFrames": WEB_VAD_PRE_ROLL_FRAMES,
+        "bargeInMultiplier": WEB_VAD_BARGE_IN_MULTIPLIER,
+    }))
+
     # Per-connection state for incoming audio. Browser sends a JSON
     # `audio_meta` first, then one binary blob with the PCM samples.
     audio_sr = 16000
@@ -248,14 +265,22 @@ async def _handle_audio(ws: WebSocket, pcm: np.ndarray, sr: int) -> None:
     (so persistence + embedder pick it up) -> trigger a brain reply just
     like a typed submit. The user is in 'talking to ECHO' mode whenever
     the browser mic is on; toggle it off in the UI to stop being heard."""
+    from echo.config import WHISPER_MIN_DURATION_WEB, WHISPER_MIN_WORDS_WEB
+
     duration = len(pcm) / sr
     log("web", f"received audio: {len(pcm)} samples, {duration:.1f}s, sr={sr}")
 
-    if duration < 0.3:
-        return  # too short to be a real utterance
+    if duration < WHISPER_MIN_DURATION_WEB:
+        log("web", f"audio too short ({duration:.1f}s), dropping")
+        return
 
+    # Web mic uses vad_filter=True (Silero VAD) + min word count because it
+    # runs always-on and picks up environmental noise / Whisper hallucinations.
     text = await asyncio.to_thread(
-        transcribe_audio, pcm, source_sr=sr, vad_filter=False, debug_label="web_mic"
+        transcribe_audio, pcm, source_sr=sr,
+        vad_filter=True,
+        debug_label="web_mic",
+        min_words=WHISPER_MIN_WORDS_WEB,
     )
     if not text:
         return

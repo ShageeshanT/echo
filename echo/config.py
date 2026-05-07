@@ -48,6 +48,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # plenty smart for casual chat. Drop back to 70b-versatile for harder
 # requests later if needed (or have brain pick by complexity).
 GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL_TOOLS = "llama-3.3-70b-versatile"   # 70B is much better at tool calling
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 # Looser, more human prompt — no forced "Sir", short replies, drop the
 # butler vibe so it actually feels like talking to a person.
@@ -56,7 +57,12 @@ GROQ_SYSTEM = (
     "talk like a sharp friend, not a butler. Keep replies short (1-2 sentences "
     "usually) unless the user asks for detail. No need for honorifics like "
     "'Sir' — drop them entirely. If something's simple, just answer. If you "
-    "don't know, say so briefly. Skip filler and hedging."
+    "don't know, say so briefly. Skip filler and hedging.\n\n"
+    "You have tools for controlling the computer (opening apps, playing YouTube, "
+    "web search, checking the time) and for searching your memory of past "
+    "conversations. Use tools when appropriate — don't tell the user to do "
+    "things you can do yourself. When you recall a memory, weave it naturally "
+    "into the conversation."
 )
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -87,6 +93,44 @@ EDGE_TTS_RATE = "+15%"
 # ---------------------------------------------------------------------------
 WHISPER_MODEL_SIZE = "small"   # ~480MB, better accuracy, ~0.5s slower than base
 
+# --- Audio pipeline tuning (web mic VAD + Whisper quality) ---
+# Client-side VAD defaults (pushed to browser on WS connect, tunable via .env)
+WEB_VAD_RMS_THRESHOLD        = float(os.environ.get("WEB_VAD_RMS_THRESHOLD", "0.02"))
+WEB_VAD_SILENCE_FRAMES       = int(os.environ.get("WEB_VAD_SILENCE_FRAMES", "30"))
+WEB_VAD_MIN_UTTERANCE_FRAMES = int(os.environ.get("WEB_VAD_MIN_UTTERANCE_FRAMES", "25"))
+WEB_VAD_PRE_ROLL_FRAMES      = int(os.environ.get("WEB_VAD_PRE_ROLL_FRAMES", "4"))
+WEB_VAD_BARGE_IN_MULTIPLIER  = float(os.environ.get("WEB_VAD_BARGE_IN_MULTIPLIER", "2.0"))
+
+# Whisper transcription quality
+WHISPER_BEAM_SIZE             = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
+WHISPER_NO_SPEECH_THRESHOLD   = float(os.environ.get("WHISPER_NO_SPEECH_THRESHOLD", "0.6"))
+WHISPER_AVG_LOGPROB_THRESHOLD = float(os.environ.get("WHISPER_AVG_LOGPROB_THRESHOLD", "-1.0"))
+WHISPER_MIN_DURATION_WEB      = float(os.environ.get("WHISPER_MIN_DURATION_WEB", "0.5"))
+WHISPER_MIN_WORDS_WEB         = int(os.environ.get("WHISPER_MIN_WORDS_WEB", "2"))
+
+# Common Whisper hallucination phrases — appear when Whisper processes silence/noise.
+WHISPER_HALLUCINATION_BLACKLIST = [
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for listening",
+    "thanks for listening",
+    "please subscribe",
+    "subscribe to my channel",
+    "like and subscribe",
+    "see you in the next video",
+    "see you next time",
+    "bye bye",
+    "bye-bye",
+    "the end",
+    "you",
+    "...",
+    "♪",
+    "music",
+    "applause",
+    "laughter",
+    "silence",
+]
+
 WAKE_SONG_PATH = os.path.join(PROJECT_ROOT, "opening.MP3")
 WAKE_SONG_DURATION = 20
 WAKE_SONG_FADE_TIME = 3
@@ -98,6 +142,11 @@ MAX_HISTORY = 10                   # rolling window kept inline; long-term memor
 
 EMBED_MODEL = "all-MiniLM-L6-v2"   # ChromaDB default ONNX embedder, 384-dim
 CHROMA_COLLECTION = "echo_memory"
+
+# --- Phase 3: memory retrieval at chat time ---
+MEMORY_RELEVANCE_THRESHOLD = 1.2   # cosine distance cutoff; lower = stricter
+MEMORY_TOP_K = 3                    # max memories injected into context
+MEMORY_CONTEXT_MAX_CHARS = 800      # truncate total memory block to fit token budget
 
 # --- Phase 2: always-on transcription ---
 # Each AudioCapture chunk is 2048 samples @ 44.1kHz = ~46.4ms.
