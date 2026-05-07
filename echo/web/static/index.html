@@ -21,14 +21,16 @@
     </header>
 
     <main>
-        <!-- Globe / visualization area (Three.js will mount here later) -->
+        <!-- Globe / visualization area — Three.js mounts a canvas here -->
         <section id="globe-stage">
-            <div id="globe-placeholder">
+            <div id="globe-mount"></div>
+            <div id="globe-overlay">
                 <div class="ring r1"></div>
                 <div class="ring r2"></div>
-                <div class="ring r3"></div>
-                <div id="rms-bar"><div id="rms-fill"></div></div>
                 <div class="echo-label">E.C.H.O.</div>
+                <div id="sub-status">SLEEPING</div>
+                <div id="wake-hint">press space or click globe to wake</div>
+                <div id="rms-bar"><div id="rms-fill"></div></div>
             </div>
         </section>
 
@@ -62,6 +64,6 @@
         </form>
     </footer>
 
-    <script src="/static/app.js"></script>
+    <script type="module" src="/static/app.js"></script>
 </body>
 </html>

@@ -29,6 +29,7 @@ import base64
 import json
 import os
 import threading
+import time
 from typing import Set
 
 import numpy as np
@@ -39,10 +40,10 @@ from fastapi.staticfiles import StaticFiles
 from echo import bus
 from echo import config  # noqa: F401  triggers .env load + flag detection
 from echo import workers  # noqa: F401  registers transcriber/persistence/embedder/post_processor
-from echo.brain import call_ai_backend
+from echo.brain import call_ai_backend, call_ai_backend_stream
 from echo.log import log
 from echo.stt.whisper import _load as load_whisper, transcribe_audio
-from echo.tts.minimax import speak_minimax  # for now; will swap to streaming later
+from echo.tts.synth import synth_async
 
 # ---------------------------------------------------------------------------
 # App + static files
@@ -71,6 +72,13 @@ async def favicon():
 # ---------------------------------------------------------------------------
 _clients: Set[WebSocket] = set()
 _loop: asyncio.AbstractEventLoop | None = None
+
+# Per-WebSocket "active stream" — the asyncio.Task currently producing a
+# response (text + TTS) for that client. Cancelled by:
+#   - a new "submit" arriving (drop the old one, start fresh)
+#   - a "stop_tts" arriving (barge-in)
+#   - the WebSocket closing
+_active_streams: dict[WebSocket, asyncio.Task] = {}
 
 
 def _broadcast(payload: dict) -> None:
@@ -124,10 +132,22 @@ def _on_bus_action_item_extracted(evt):
     })
 
 
+def _on_bus_media_playing(evt):
+    """ECHO triggered external media (YouTube etc). Tell every connected
+    browser to pause its mic so it doesn't transcribe the song lyrics back
+    to ECHO. User clicks the mic button to resume."""
+    p = evt.payload or {}
+    _broadcast({
+        "type": "mic.pause",
+        "reason": p.get("source", "media"),
+    })
+
+
 bus.subscribe("audio.rms", _on_bus_audio_rms)
 bus.subscribe("transcript.final", _on_bus_transcript_final)
 bus.subscribe("memory.extracted", _on_bus_memory_extracted)
 bus.subscribe("action_item.extracted", _on_bus_action_item_extracted)
+bus.subscribe("media.playing", _on_bus_media_playing)
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +181,29 @@ async def ws_endpoint(ws: WebSocket):
                 if t == "submit":
                     text = (data.get("text") or "").strip()
                     if text:
-                        # Run brain off the asyncio thread so we don't block
-                        # incoming audio frames.
-                        asyncio.create_task(_handle_submit(ws, text))
+                        _start_response(ws, text)
 
                 elif t == "audio_meta":
                     audio_sr = int(data.get("sample_rate", 16000))
+
+                elif t == "wake":
+                    # Browser entered active mode — kick off the contextual
+                    # greeting (system health + desktop scan + LLM-ish text).
+                    _cancel_active_stream(ws)
+                    task = asyncio.create_task(_handle_wake(ws))
+                    _active_streams[ws] = task
+                    task.add_done_callback(
+                        lambda _t, _ws=ws: _active_streams.pop(_ws, None)
+                    )
+
+                elif t == "sleep":
+                    # Browser entered sleep mode — kill any in-flight TTS.
+                    _cancel_active_stream(ws)
+
+                elif t == "stop_tts":
+                    # Barge-in — user started talking, kill the current
+                    # response stream + remaining TTS.
+                    _cancel_active_stream(ws)
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 # Browser finalized an utterance and sent raw float32 PCM.
@@ -177,23 +214,42 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        _cancel_active_stream(ws)
         _clients.discard(ws)
         log("web", f"client disconnected ({len(_clients)} total)")
+
+
+def _cancel_active_stream(ws: WebSocket) -> None:
+    """Cancel and clear any in-flight response task for this WS."""
+    task = _active_streams.pop(ws, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _start_response(ws: WebSocket, text: str) -> None:
+    """Cancel any in-flight stream for this WS, then start a fresh
+    response (text + TTS). Used by both the typed `submit` path and the
+    voice path after audio is transcribed — keeps the cancel/track
+    bookkeeping in one place."""
+    _cancel_active_stream(ws)
+    task = asyncio.create_task(_handle_submit(ws, text))
+    _active_streams[ws] = task
+    task.add_done_callback(lambda _t, _ws=ws: _active_streams.pop(_ws, None))
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 async def _handle_audio(ws: WebSocket, pcm: np.ndarray, sr: int) -> None:
-    """Browser sent finalized audio. Whisper -> publish transcript.final ->
-    bus subscribers (persistence, embedder) take it from there. The brain
-    is NOT auto-triggered from passive utterances; user must hit the
-    'send to ECHO' button or it's left as ambient capture."""
+    """Browser sent finalized audio. Whisper -> publish transcript.final
+    (so persistence + embedder pick it up) -> trigger a brain reply just
+    like a typed submit. The user is in 'talking to ECHO' mode whenever
+    the browser mic is on; toggle it off in the UI to stop being heard."""
     duration = len(pcm) / sr
     log("web", f"received audio: {len(pcm)} samples, {duration:.1f}s, sr={sr}")
 
     if duration < 0.3:
-        return  # too short
+        return  # too short to be a real utterance
 
     text = await asyncio.to_thread(
         transcribe_audio, pcm, source_sr=sr, vad_filter=False, debug_label="web_mic"
@@ -201,6 +257,7 @@ async def _handle_audio(ws: WebSocket, pcm: np.ndarray, sr: int) -> None:
     if not text:
         return
 
+    log("web", f"voice transcript -> {text!r}")
     import time as _t
     bus.publish("transcript.final", {
         "text": text,
@@ -208,102 +265,145 @@ async def _handle_audio(ws: WebSocket, pcm: np.ndarray, sr: int) -> None:
         "duration_s": duration,
     })
 
+    # Voice-in -> response-out: same path as typed submit.
+    _start_response(ws, text)
 
-async def _handle_submit(ws: WebSocket, text: str) -> None:
-    """User typed (or spoke + clicked send). Run brain, stream chunks back."""
-    await ws.send_text(json.dumps({"type": "status", "value": "thinking"}))
+
+async def _handle_wake(ws: WebSocket) -> None:
+    """Browser woke up — scan system + desktop, build a contextual greeting,
+    deliver it as a normal response (text + TTS)."""
+    from echo.context.desktop import get_desktop_context
+    from echo.context.greeting import build_wake_greeting
+    from echo.context.system_health import get_system_health
+    from echo.brain import history
+
+    # Run scans in worker threads (they're sync + slow-ish).
+    health = await asyncio.to_thread(get_system_health)
+    ctx = await asyncio.to_thread(get_desktop_context)
+
+    try:
+        greeting = build_wake_greeting(ctx, health)
+    except Exception:
+        greeting = "Online. What's up?"
+
+    # Inject context as a system note so the next chat turn knows what's open.
+    context_msg = (
+        f"[ECHO just woke up. Time: {ctx.get('time', '?')}, {ctx.get('date', '?')}. "
+        f"Open apps: {', '.join(ctx.get('app_names', []))}. "
+        f"Activities: {', '.join(ctx.get('activities', []))}. "
+        f"Battery: {health.get('battery_percent', 'N/A')}%, "
+        f"RAM used: {health.get('ram_percent_used', 'N/A')}%, "
+        f"Internet: {'connected' if health.get('internet') else 'disconnected'}.]"
+    )
+    history.append("system", context_msg)
+
     await ws.send_text(json.dumps({"type": "response.start"}))
-
-    reply = await asyncio.to_thread(call_ai_backend, text)
-
-    if reply == "__SLEEP__":
-        await ws.send_text(json.dumps({"type": "response.chunk", "text": "Going to sleep."}))
-        await ws.send_text(json.dumps({"type": "response.end"}))
-        await ws.send_text(json.dumps({"type": "status", "value": "sleeping"}))
-        return
-    if reply == "__EXIT__":
-        await ws.send_text(json.dumps({"type": "response.chunk", "text": "Goodbye."}))
-        await ws.send_text(json.dumps({"type": "response.end"}))
-        return
-
-    # Until we wire streaming Groq, send the whole reply at once.
-    await ws.send_text(json.dumps({"type": "response.chunk", "text": reply}))
+    await ws.send_text(json.dumps({"type": "response.chunk", "text": greeting}))
     await ws.send_text(json.dumps({"type": "response.end"}))
     await ws.send_text(json.dumps({"type": "status", "value": "speaking"}))
 
-    # Synthesize speech in parallel — don't block the response chunk delivery.
-    asyncio.create_task(_synthesize_and_send(ws, reply))
+    # Synth in worker thread, send when ready, then back to online.
+    audio = await synth_async(greeting)
+    if audio:
+        b64 = base64.b64encode(audio).decode("ascii")
+        await _send_safe(ws, {"type": "response.tts_chunk_b64", "data": b64})
+    await _send_safe(ws, {"type": "status", "value": "online"})
 
 
-async def _synthesize_and_send(ws: WebSocket, text: str) -> None:
-    """Stream MiniMax MP3 bytes to browser. Phase A is non-streaming (one
-    blob); Phase B will swap to MiniMax stream=True for true streaming."""
-    # Off-thread synthesis so we don't block the asyncio loop
-    audio_bytes = await asyncio.to_thread(_synth_minimax_to_bytes, text)
-    if not audio_bytes:
-        await ws.send_text(json.dumps({"type": "status", "value": "online"}))
-        return
+async def _handle_submit(ws: WebSocket, text: str) -> None:
+    """User typed (or spoke + clicked send). Run STREAMING brain, send each
+    sentence as it arrives, kick off MiniMax synth in parallel, send TTS
+    chunks in order. Cancellable mid-flight via barge-in."""
+    await ws.send_text(json.dumps({"type": "status", "value": "thinking"}))
+    await ws.send_text(json.dumps({"type": "response.start"}))
 
-    b64 = base64.b64encode(audio_bytes).decode("ascii")
+    # Queue of pending TTS futures, IN ORDER. Producer kicks them off,
+    # consumer awaits them sequentially and forwards audio.
+    tts_q: asyncio.Queue = asyncio.Queue()
+
+    async def producer():
+        first_yield = True
+        try:
+            async for sentence in call_ai_backend_stream(text):
+                if first_yield:
+                    first_yield = False
+                    if sentence == "__SLEEP__":
+                        await _send_safe(ws, {"type": "response.chunk",
+                                              "text": "Going to sleep."})
+                        await _send_safe(ws, {"type": "response.end"})
+                        await _send_safe(ws, {"type": "status", "value": "sleeping"})
+                        return
+                    if sentence == "__EXIT__":
+                        await _send_safe(ws, {"type": "response.chunk",
+                                              "text": "Goodbye."})
+                        await _send_safe(ws, {"type": "response.end"})
+                        return
+
+                # 1. Emit the text immediately for the typewriter UI.
+                await _send_safe(ws, {"type": "response.chunk",
+                                      "text": sentence + " "})
+                # 2. Start MiniMax synth in parallel — task goes to consumer.
+                synth_task = asyncio.create_task(synth_async(sentence))
+                await tts_q.put(synth_task)
+        finally:
+            await tts_q.put(None)  # sentinel so consumer can finish
+
+    async def consumer():
+        sent_speaking = False
+        while True:
+            item = await tts_q.get()
+            if item is None:
+                break
+            if not sent_speaking:
+                await _send_safe(ws, {"type": "status", "value": "speaking"})
+                sent_speaking = True
+            try:
+                audio = await item
+            except asyncio.CancelledError:
+                # Drain remaining tasks so they don't leak
+                while not tts_q.empty():
+                    nxt = tts_q.get_nowait()
+                    if nxt is not None and not nxt.done():
+                        nxt.cancel()
+                raise
+            if audio:
+                b64 = base64.b64encode(audio).decode("ascii")
+                await _send_safe(ws, {"type": "response.tts_chunk_b64",
+                                      "data": b64})
+        # Stream finished cleanly
+        await _send_safe(ws, {"type": "response.end"})
+        await _send_safe(ws, {"type": "status", "value": "online"})
+
     try:
-        await ws.send_text(json.dumps({"type": "response.tts_chunk_b64", "data": b64}))
+        await asyncio.gather(producer(), consumer())
+    except asyncio.CancelledError:
+        # Barge-in / new submit / disconnect — let the WS know we stopped
+        await _send_safe(ws, {"type": "tts.stopped"})
+        await _send_safe(ws, {"type": "status", "value": "online"})
+        raise
+    except Exception as e:
+        log("web", f"submit handler error: {e!r}")
+        await _send_safe(ws, {"type": "response.end"})
+        await _send_safe(ws, {"type": "status", "value": "online"})
+
+
+async def _send_safe(ws: WebSocket, payload: dict) -> None:
+    """Send JSON and swallow disconnect errors so handlers can still
+    finish their cleanup paths."""
+    try:
+        await ws.send_text(json.dumps(payload))
     except Exception:
         pass
-    await ws.send_text(json.dumps({"type": "status", "value": "online"}))
-
-
-def _synth_minimax_to_bytes(text: str) -> bytes:
-    """Synth via MiniMax, return raw MP3 bytes (no playback). Quick
-    adaptation of speak_minimax's request without the pygame play step."""
-    import requests
-    from echo.config import (
-        MINIMAX_API_KEY, MINIMAX_ENDPOINT, MINIMAX_MODEL, MINIMAX_VOICE_ID,
-    )
-    if not MINIMAX_API_KEY:
-        return b""
-    try:
-        resp = requests.post(
-            MINIMAX_ENDPOINT,
-            headers={
-                "Authorization": f"Bearer {MINIMAX_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MINIMAX_MODEL,
-                "text": text,
-                "stream": False,
-                "voice_setting": {
-                    "voice_id": MINIMAX_VOICE_ID,
-                    "speed": 1.0, "vol": 1.0, "pitch": 0,
-                },
-                "audio_setting": {
-                    "sample_rate": 44100, "bitrate": 128000,
-                    "format": "mp3", "channel": 1,
-                },
-                "output_format": "hex",
-            },
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            log("web", f"MiniMax error {resp.status_code}")
-            return b""
-        data = resp.json()
-        if data.get("base_resp", {}).get("status_code", -1) != 0:
-            return b""
-        audio_hex = data.get("data", {}).get("audio", "")
-        if not audio_hex:
-            return b""
-        return bytes.fromhex(audio_hex)
-    except Exception as e:
-        log("web", f"MiniMax exception: {e!r}")
-        return b""
 
 
 # ---------------------------------------------------------------------------
-# Pre-warm: load whisper at startup so first transcribe is instant
+# Pre-warm — load whisper at startup so the first transcription is instant.
+# (TTS providers used to need warmup but Edge/MiniMax are reasonably steady
+# now; we save the synth round-trip until the first real request.)
 # ---------------------------------------------------------------------------
 def _prewarm():
     threading.Thread(target=load_whisper, daemon=True).start()
+    log("web", f"prewarming whisper; TTS provider = {config.TTS_PROVIDER}")
 
 
 _prewarm()

@@ -23,7 +23,7 @@ def dispatch(user_text: str) -> str | None:
             query = query.replace(prefix, "").strip()
         if query:
             browser.play_youtube(query)
-            return f"Playing {query} on YouTube, Sir."
+            return f"Playing {query} on YouTube."
 
     # App / URL launchers
     if any(w in lower for w in ["open", "launch", "start", "run"]):
@@ -34,9 +34,9 @@ def dispatch(user_text: str) -> str | None:
                         apps.open_brave(cmd)
                     else:
                         apps.open_app(cmd)
-                    return f"Opening {name} for you, Sir."
+                    return f"Opening {name}."
                 except Exception:
-                    return f"I couldn't open {name}, Sir."
+                    return f"Couldn't open {name}."
 
     # Web search
     if any(w in lower for w in ["search for", "google", "look up", "search"]):
@@ -45,23 +45,23 @@ def dispatch(user_text: str) -> str | None:
             query = query.replace(prefix, "").strip()
         if query:
             browser.web_search(query)
-            return f"Searching for {query}, Sir."
+            return f"Searching for {query}."
 
     # Time
     if "what time" in lower or "current time" in lower or lower == "time":
-        return f"It's currently {system.current_time()}, Sir."
+        return f"It's {system.current_time()}."
 
     # Date
     if "what date" in lower or "today's date" in lower or "what day" in lower:
-        return f"Today is {system.current_date()}, Sir."
+        return f"Today's {system.current_date()}."
 
     # Mute toggle
     if "mute" in lower or "unmute" in lower:
         result = system.toggle_mute()
         if result == "muted":
-            return "Muted, Sir."
+            return "Muted."
         if result == "unmuted":
-            return "Unmuted, Sir."
+            return "Unmuted."
         # On failure, fall through to LLM
 
     # Sleep / exit sentinels

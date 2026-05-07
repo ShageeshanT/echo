@@ -64,12 +64,19 @@ GEMINI_MODEL = "gemini-2.5-flash"       # vision + tool calling, free tier
 
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
-# English_Magnetic_Voice — warm, conversational, sounds way more human.
-# Other natural options: English_Trustworthy_Man, English_Confident_Man,
-# English_Imaginative_Man. Swap MINIMAX_VOICE_ID to taste.
-MINIMAX_VOICE_ID = "English_Magnetic_Voice"
+# English_Trustworthy_Man — natural professional male voice that's actually
+# available on the speech-2.8-hd model (verified). Other working options:
+# English_FriendlyPerson, English_Aussie_Bloke, English_Diligent_Man,
+# English_GentleTeacher, male-qn-jingying. Swap MINIMAX_VOICE_ID to taste.
+MINIMAX_VOICE_ID = "English_Trustworthy_Man"
 MINIMAX_MODEL = "speech-2.8-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
+
+# --- TTS provider selection ---
+# `edge` (default): Microsoft Edge TTS — free, no API key, ~0.9s first byte.
+# `minimax`: paid, slower (~3.8s first byte) but you already have credits.
+# Switch via TTS_PROVIDER in .env.
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge").lower()
 
 EDGE_TTS_VOICE = "en-GB-RyanNeural"
 EDGE_TTS_RATE = "+15%"
@@ -78,7 +85,7 @@ EDGE_TTS_RATE = "+15%"
 # ---------------------------------------------------------------------------
 # Model / runtime settings
 # ---------------------------------------------------------------------------
-WHISPER_MODEL_SIZE = "base"
+WHISPER_MODEL_SIZE = "small"   # ~480MB, better accuracy, ~0.5s slower than base
 
 WAKE_SONG_PATH = os.path.join(PROJECT_ROOT, "opening.MP3")
 WAKE_SONG_DURATION = 20

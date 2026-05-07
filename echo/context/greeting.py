@@ -5,7 +5,7 @@ def build_wake_greeting(ctx, health):
     parts = []
 
     # Greeting + time
-    parts.append(f"{ctx['greeting']}, Sir. It's {ctx['time']} on {ctx['date']}.")
+    parts.append(f"{ctx['greeting']}. It's {ctx['time']} on {ctx['date']}.")
 
     # System health
     notes = []
@@ -73,5 +73,5 @@ def build_wake_greeting(ctx, health):
         else:
             parts.append(f"Looks like you were {listed}.")
 
-    parts.append("Where shall we begin, Sir?")
+    parts.append("What's on the agenda?")
     return ' '.join(parts)

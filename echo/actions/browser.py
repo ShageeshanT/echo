@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.parse
 
+from echo import bus
 from echo.actions.apps import open_brave
 
 
@@ -35,6 +36,10 @@ def play_youtube(query: str) -> None:
             pass
 
     threading.Thread(target=_autoplay, daemon=True).start()
+    # Notify the bus that media will be playing through speakers — the web
+    # frontend listens for this and pauses its mic so it doesn't transcribe
+    # the song lyrics back to ECHO.
+    bus.publish("media.playing", {"source": "youtube", "query": query})
 
 
 def web_search(query: str) -> None:
