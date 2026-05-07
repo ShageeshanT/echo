@@ -59,7 +59,7 @@ const globe = new DotGlobe($("globe-mount"));
 // ──────────────────────────────────────────────────────────────────────
 // Sleep / wake state machine
 // ──────────────────────────────────────────────────────────────────────
-function setSleeping(sleeping) {
+function setSleeping(sleeping, skipNotify = false) {
     STATE.sleeping = sleeping;
     globe.setSleeping(sleeping);
     document.getElementById("globe-stage").classList.toggle("sleeping", sleeping);
@@ -73,8 +73,8 @@ function setSleeping(sleeping) {
         // here via a click/spacebar, that satisfies the gesture requirement.
         startMic().catch(() => {});
     }
-    // Tell server about state change
-    if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
+    // Tell server about state change (skip when the server told US to change)
+    if (!skipNotify && STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
         STATE.ws.send(JSON.stringify({type: sleeping ? "sleep" : "wake"}));
     }
 }
@@ -138,6 +138,10 @@ function handleEvent(m) {
             $("globe-stage").classList.remove("online", "thinking", "speaking", "listening");
             if (m.value && m.value !== "sleeping") $("globe-stage").classList.add(m.value);
             $("sub-status").textContent = (m.value || "online").toUpperCase();
+            // Sync sleeping state with server — skipNotify to avoid echo loop
+            if (m.value === "sleeping" && !STATE.sleeping) {
+                setSleeping(true, true);
+            }
             break;
         case "audio.rms":
             // Backend (Python AudioCapture in Tkinter mode) publishes this;

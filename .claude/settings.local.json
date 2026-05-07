@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(git log *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(xargs wc *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('echo/web/server.py'\\).read\\(\\)\\); print\\('server.py: OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('echo/state.py'\\).read\\(\\)\\); print\\('state.py: OK'\\)\")",
+      "Bash(node -e \"try { require\\('fs'\\).readFileSync\\('echo/web/static/app.js', 'utf8'\\); console.log\\('app.js: readable'\\); } catch\\(e\\) { console.error\\(e\\); }\")",
+      "Bash(python -c \"from echo import state; print\\('state import OK, is_sleeping:', state.is_sleeping\\); state.set_sleeping\\(False\\); print\\('set_sleeping OK, is_sleeping:', state.is_sleeping\\)\")",
+      "Bash(timeout 10 python -c \"from echo.web.server import app; print\\('server import OK'\\)\")",
+      "Bash(echo \"exit code: $?\")"
     ]
   }
 }

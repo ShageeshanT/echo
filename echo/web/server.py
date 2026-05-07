@@ -39,6 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 from echo import bus
 from echo import config  # noqa: F401  triggers .env load + flag detection
+from echo import state
 from echo import workers  # noqa: F401  registers transcriber/persistence/embedder/post_processor
 from echo.brain import call_ai_backend, call_ai_backend_stream
 from echo.log import log
@@ -161,7 +162,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _clients.add(ws)
     log("web", f"client connected ({len(_clients)} total)")
-    await ws.send_text(json.dumps({"type": "status", "value": "online"}))
+    await ws.send_text(json.dumps({"type": "status", "value": "sleeping"}))
 
     # Per-connection state for incoming audio. Browser sends a JSON
     # `audio_meta` first, then one binary blob with the PCM samples.
@@ -189,6 +190,7 @@ async def ws_endpoint(ws: WebSocket):
                 elif t == "wake":
                     # Browser entered active mode — kick off the contextual
                     # greeting (system health + desktop scan + LLM-ish text).
+                    state.set_sleeping(False)
                     _cancel_active_stream(ws)
                     task = asyncio.create_task(_handle_wake(ws))
                     _active_streams[ws] = task
@@ -198,6 +200,7 @@ async def ws_endpoint(ws: WebSocket):
 
                 elif t == "sleep":
                     # Browser entered sleep mode — kill any in-flight TTS.
+                    state.set_sleeping(True)
                     _cancel_active_stream(ws)
 
                 elif t == "stop_tts":
@@ -321,30 +324,46 @@ async def _handle_submit(ws: WebSocket, text: str) -> None:
     # consumer awaits them sequentially and forwards audio.
     tts_q: asyncio.Queue = asyncio.Queue()
 
+    # Flag set by the producer when it handles a sentinel (__SLEEP__ /
+    # __EXIT__) so the consumer knows NOT to send its own response.end +
+    # status "online" (which would undo the sleep).
+    sentinel_handled = {"value": False}
+
     async def producer():
         first_yield = True
+        any_yielded = False
         try:
             async for sentence in call_ai_backend_stream(text):
                 if first_yield:
                     first_yield = False
                     if sentence == "__SLEEP__":
+                        sentinel_handled["value"] = True
                         await _send_safe(ws, {"type": "response.chunk",
                                               "text": "Going to sleep."})
                         await _send_safe(ws, {"type": "response.end"})
                         await _send_safe(ws, {"type": "status", "value": "sleeping"})
                         return
                     if sentence == "__EXIT__":
+                        sentinel_handled["value"] = True
                         await _send_safe(ws, {"type": "response.chunk",
                                               "text": "Goodbye."})
                         await _send_safe(ws, {"type": "response.end"})
+                        await _send_safe(ws, {"type": "status", "value": "sleeping"})
                         return
 
+                any_yielded = True
                 # 1. Emit the text immediately for the typewriter UI.
                 await _send_safe(ws, {"type": "response.chunk",
                                       "text": sentence + " "})
-                # 2. Start MiniMax synth in parallel — task goes to consumer.
+                # 2. Start TTS synth in parallel — task goes to consumer.
                 synth_task = asyncio.create_task(synth_async(sentence))
                 await tts_q.put(synth_task)
+
+            # If the brain yielded nothing (Groq unreachable, empty response),
+            # send an error so the user isn't staring at a blank screen.
+            if not any_yielded and not sentinel_handled["value"]:
+                await _send_safe(ws, {"type": "response.chunk",
+                                      "text": "I'm having trouble reaching my servers."})
         finally:
             await tts_q.put(None)  # sentinel so consumer can finish
 
@@ -370,9 +389,10 @@ async def _handle_submit(ws: WebSocket, text: str) -> None:
                 b64 = base64.b64encode(audio).decode("ascii")
                 await _send_safe(ws, {"type": "response.tts_chunk_b64",
                                       "data": b64})
-        # Stream finished cleanly
-        await _send_safe(ws, {"type": "response.end"})
-        await _send_safe(ws, {"type": "status", "value": "online"})
+        # Only send end/online if the producer didn't already handle a sentinel
+        if not sentinel_handled["value"]:
+            await _send_safe(ws, {"type": "response.end"})
+            await _send_safe(ws, {"type": "status", "value": "online"})
 
     try:
         await asyncio.gather(producer(), consumer())
